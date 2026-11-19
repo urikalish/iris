@@ -57,6 +57,7 @@
             cursor: pointer;
         }
         button:active { transform: scale(0.98); }
+        button.stop { background: var(--danger); color: #fff; }
         input:disabled, button:disabled { opacity: 0.4; cursor: not-allowed; }
 
         .lamp {
@@ -96,7 +97,7 @@
 
     <div class="field">
         <label for="unit">Basic time unit (ms)</label>
-        <input id="unit" type="number" inputmode="numeric" min="20" step="10" value="500">
+        <input id="unit" type="number" inputmode="numeric" min="20" step="10" value="200">
     </div>
 
     <div class="field">
@@ -140,16 +141,28 @@
         let track = null;   // video track that controls the torch
         let stream = null;
         let wakeLock = null;
+        let running = false;
+        let stopRequested = false;
+        let wakeWaiter = null; // resolves the current wait early when STOP is pressed
 
         function setStatus(msg, isError = false) {
             $status.textContent = msg;
             $status.classList.toggle("error", isError);
         }
 
-        function setUiEnabled(enabled) {
-            $unit.disabled = !enabled;
-            $text.disabled = !enabled;
-            $go.disabled = !enabled;
+        // While broadcasting, the inputs are disabled and the button becomes STOP.
+        function setRunning(isRunning) {
+            running = isRunning;
+            $unit.disabled = isRunning;
+            $text.disabled = isRunning;
+            $go.textContent = isRunning ? "STOP" : "GO";
+            $go.classList.toggle("stop", isRunning);
+            $go.setAttribute("aria-pressed", String(isRunning));
+        }
+
+        function requestStop() {
+            stopRequested = true;
+            if (wakeWaiter) wakeWaiter();
         }
 
         // Normalise text: uppercase, collapse whitespace, drop unsupported chars.
@@ -235,9 +248,15 @@
         }
 
         // Wait until an absolute time (performance.now based) to avoid drift.
+        // Returns early if STOP is pressed.
         function waitUntil(t) {
             const ms = t - performance.now();
-            return ms > 0 ? new Promise(r => setTimeout(r, ms)) : Promise.resolve();
+            if (ms <= 0 || stopRequested) return Promise.resolve();
+            return new Promise(resolve => {
+                const id = setTimeout(done, ms);
+                function done() { clearTimeout(id); wakeWaiter = null; resolve(); }
+                wakeWaiter = done;
+            });
         }
 
         function renderMorse(text, activeIndex) {
@@ -271,49 +290,65 @@
                 return;
             }
 
-            setUiEnabled(false);
+            stopRequested = false;
+            setRunning(true);
             setStatus("Starting torch…");
 
             try {
                 await getTorchTrack();
             } catch (err) {
                 setStatus((err && err.message) || "Could not access the torch.", true);
-                setUiEnabled(true);
+                stopStream();
+                setRunning(false);
                 return;
             }
 
-            await acquireWakeLock();
-            await setTorch(false);
-
-            const timeline = buildTimeline(text);
-            const totalUnits = timeline.reduce((s, x) => s + x.units, 0);
-            setStatus(`Sending "${text}" — ${(totalUnits * unit / 1000).toFixed(1)} s`);
-            renderMorse(text, -1);
-
             try {
+                if (stopRequested) { setStatus("Stopped."); return; }
+
+                await acquireWakeLock();
+                await setTorch(false);
+
+                const timeline = buildTimeline(text);
+                const totalUnits = timeline.reduce((s, x) => s + x.units, 0);
+                setStatus(`Sending "${text}" — ${(totalUnits * unit / 1000).toFixed(1)} s`);
+                renderMorse(text, -1);
+
                 let t = performance.now() + 100; // small lead-in
                 await waitUntil(t);
                 for (const seg of timeline) {
+                    if (stopRequested) break;
                     renderMorse(text, seg.charIndex);
                     await setTorch(seg.on);
                     t += seg.units * unit;
                     await waitUntil(t);
                 }
                 await setTorch(false);
-                renderMorse(text, text.length);
-                setStatus("Done.");
+                if (stopRequested) {
+                    setStatus("Stopped.");
+                } else {
+                    renderMorse(text, text.length);
+                    setStatus("Done.");
+                }
             } catch (err) {
                 setStatus("Transmission error: " + ((err && err.message) || err), true);
             } finally {
                 await setTorch(false);
                 stopStream();          // release the camera so the torch is fully off
                 releaseWakeLock();
-                setUiEnabled(true);
+                setRunning(false);
             }
         }
 
-        $go.addEventListener("click", broadcast);
-        $text.addEventListener("keydown", e => { if (e.key === "Enter") { $text.blur(); broadcast(); } });
+        function toggle() {
+            if (running) requestStop();
+            else broadcast();
+        }
+
+        $go.addEventListener("click", toggle);
+        $text.addEventListener("keydown", e => {
+            if (e.key === "Enter" && !running) { $text.blur(); broadcast(); }
+        });
 
         // Make sure the torch goes off if the page is hidden or closed.
         document.addEventListener("visibilitychange", () => {
